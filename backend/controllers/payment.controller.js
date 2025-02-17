@@ -1,143 +1,115 @@
-import Coupon from "../models/coupon.model.js";
 import Order from "../models/order.model.js";
-import { stripe } from "../lib/stripe.js";
+import Product from "../models/product.model.js";
 
-export const createCheckoutSession = async (req, res) => {
-	try {
-		const { products, couponCode } = req.body;
+// Sipariş oluşturma fonksiyonu
+export const createOrder = async (req, res) => {
+  try {
+    const { products, city, district, phone } = req.body;
 
-		if (!Array.isArray(products) || products.length === 0) {
-			return res.status(400).json({ error: "Invalid or empty products array" });
-		}
+    // Geçerli ürünlerin olup olmadığını kontrol et
+    if (!Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ error: "Sepetiniz boş!" });
+    }
 
-		let totalAmount = 0;
+    // Geçerli şehir ve ilçe seçimi kontrolü
+    if (!city || !district) {
+      return res.status(400).json({ error: "Lütfen il ve ilçe seçin!" });
+    }
 
-		const lineItems = products.map((product) => {
-			const amount = Math.round(product.price * 100); // stripe wants u to send in the format of cents
-			totalAmount += amount * product.quantity;
+    // Geçerli telefon numarası kontrolü
+    if (!phone || phone.length < 10) {
+      return res.status(400).json({ error: "Geçerli bir telefon numarası girin!" });
+    }
 
-			return {
-				price_data: {
-					currency: "usd",
-					product_data: {
-						name: product.name,
-						images: [product.image],
-					},
-					unit_amount: amount,
-				},
-				quantity: product.quantity || 1,
-			};
-		});
+    let totalAmount = 0;
 
-		let coupon = null;
-		if (couponCode) {
-			coupon = await Coupon.findOne({ code: couponCode, userId: req.user._id, isActive: true });
-			if (coupon) {
-				totalAmount -= Math.round((totalAmount * coupon.discountPercentage) / 100);
-			}
-		}
+    // Ürünleri kontrol et ve sipariş için gerekli verileri oluştur
+    const orderProducts = await Promise.all(
+      products.map(async (p) => {
+        if (!p.product) {
+          throw new Error("Ürün ID'si eksik!");
+        }
 
-		const session = await stripe.checkout.sessions.create({
-			payment_method_types: ["card"],
-			line_items: lineItems,
-			mode: "payment",
-			success_url: `${process.env.CLIENT_URL}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
-			cancel_url: `${process.env.CLIENT_URL}/purchase-cancel`,
-			discounts: coupon
-				? [
-						{
-							coupon: await createStripeCoupon(coupon.discountPercentage),
-						},
-				  ]
-				: [],
-			metadata: {
-				userId: req.user._id.toString(),
-				couponCode: couponCode || "",
-				products: JSON.stringify(
-					products.map((p) => ({
-						id: p._id,
-						quantity: p.quantity,
-						price: p.price,
-					}))
-				),
-			},
-		});
+        const product = await Product.findById(p.product);
+        if (!product) {
+          throw new Error(`Ürün bulunamadı: ${p.product}`);
+        }
 
-		if (totalAmount >= 20000) {
-			await createNewCoupon(req.user._id);
-		}
-		res.status(200).json({ id: session.id, totalAmount: totalAmount / 100 });
-	} catch (error) {
-		console.error("Error processing checkout:", error);
-		res.status(500).json({ message: "Error processing checkout", error: error.message });
-	}
+        totalAmount += product.price * p.quantity;
+
+        return {
+          product: product._id,
+          name: product.name,
+          quantity: p.quantity,
+          price: product.price,
+        };
+      })
+    );
+
+    // Yeni siparişi oluştur
+    const newOrder = new Order({
+      user: req.user._id,
+      products: orderProducts,
+      totalAmount,
+      city,
+      district,
+      phone,
+    });
+
+    // Siparişi kaydet
+    await newOrder.save();
+
+    // Sipariş başarıyla oluşturulduğunda, kullanıcının sepetini temizle
+    req.user.cartItems = [];
+    await req.user.save(); // Sepeti sıfırla
+
+    res.status(201).json({
+      success: true,
+      message: "Sipariş başarıyla oluşturuldu.",
+      orderId: newOrder._id,
+    });
+  } catch (error) {
+    console.error("Sipariş oluşturulurken hata oluştu:", error);
+    res.status(500).json({ message: "Sipariş oluşturulurken hata oluştu", error: error.message });
+  }
 };
 
-export const checkoutSuccess = async (req, res) => {
-	try {
-		const { sessionId } = req.body;
-		const session = await stripe.checkout.sessions.retrieve(sessionId);
+// Sipariş detaylarını döndürme
+export const getOrderDetails = async (req, res) => {
+  try {
+    const { orderId } = req.params;
 
-		if (session.payment_status === "paid") {
-			if (session.metadata.couponCode) {
-				await Coupon.findOneAndUpdate(
-					{
-						code: session.metadata.couponCode,
-						userId: session.metadata.userId,
-					},
-					{
-						isActive: false,
-					}
-				);
-			}
+    // Siparişi ID ile bulalım
+    const order = await Order.findById(orderId)
+      .populate("products.product", "name price") // Ürün ismi ve fiyatını da alalım
+      .populate("user", "name email"); // Kullanıcı bilgileri
+    if (!order) {
+      return res.status(404).json({ message: "Sipariş bulunamadı!" });
+    }
 
-			// create a new Order
-			const products = JSON.parse(session.metadata.products);
-			const newOrder = new Order({
-				user: session.metadata.userId,
-				products: products.map((product) => ({
-					product: product.id,
-					quantity: product.quantity,
-					price: product.price,
-				})),
-				totalAmount: session.amount_total / 100, // convert from cents to dollars,
-				stripeSessionId: sessionId,
-			});
-
-			await newOrder.save();
-
-			res.status(200).json({
-				success: true,
-				message: "Payment successful, order created, and coupon deactivated if used.",
-				orderId: newOrder._id,
-			});
-		}
-	} catch (error) {
-		console.error("Error processing successful checkout:", error);
-		res.status(500).json({ message: "Error processing successful checkout", error: error.message });
-	}
+    res.status(200).json(order); // Sipariş bilgilerini gönderiyoruz
+  } catch (error) {
+    console.error("Sipariş detayları alınırken hata oluştu:", error);
+    res.status(500).json({ message: "Sipariş detayları alınırken hata oluştu", error: error.message });
+  }
 };
+// Admin siparişlerini listeleme
 
-async function createStripeCoupon(discountPercentage) {
-	const coupon = await stripe.coupons.create({
-		percent_off: discountPercentage,
-		duration: "once",
-	});
+// payment.controller.js
 
-	return coupon.id;
-}
+export const getAdminOrders = async (req, res) => {
+    try {
+        const orders = await Order.find()  // Veritabanındaki tüm siparişleri alıyoruz
+            .populate("user", "name email")  // Sipariş veren kişinin bilgilerini alıyoruz
+            .populate("products.product", "name price");  // Ürün bilgilerini alıyoruz
+        
+        if (orders.length === 0) {
+            return res.status(404).json({ message: "Sipariş bulunamadı!" });
+        }
 
-async function createNewCoupon(userId) {
-	await Coupon.findOneAndDelete({ userId });
-
-	const newCoupon = new Coupon({
-		code: "GIFT" + Math.random().toString(36).substring(2, 8).toUpperCase(),
-		discountPercentage: 10,
-		expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
-		userId: userId,
-	});
-
-	await newCoupon.save();
-
-	return newCoupon;
-}
+        res.status(200).json(orders);  // Siparişleri döndürüyoruz
+    } catch (error) {
+        console.error("Siparişler alınırken hata oluştu:", error);
+        res.status(500).json({ message: "Siparişler alınırken hata oluştu", error: error.message });
+    }
+};
